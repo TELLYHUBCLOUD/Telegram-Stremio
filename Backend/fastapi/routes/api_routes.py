@@ -7,22 +7,18 @@ async def list_media_api(
     media_type: str = Query("movie", regex="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
-    search: str = Query("", max_length=100)
+    search: str = Query("", max_length=100),
 ):
     try:
         if search:
-            result = await db.search_documents(search, page, page_size)
-            filtered_results = [item for item in result['results'] if item.get('media_type') == media_type]
-            total_filtered = len(filtered_results)
-            start_index = (page - 1) * page_size
-            end_index = start_index + page_size
-            paged_results = filtered_results[start_index:end_index]
-            
+            result = await db.search_documents(search, page, page_size, media_type)
             return {
-                "total_count": total_filtered,
+                "total_count": result["total_count"],
                 "current_page": page,
-                "total_pages": (total_filtered + page_size - 1) // page_size,
-                "movies" if media_type == "movie" else "tv_shows": paged_results
+                "total_pages": result["total_pages"],
+                "movies"
+                if media_type == "movie"
+                else "tv_shows": result["results"],
             }
         else:
             if media_type == "movie":
