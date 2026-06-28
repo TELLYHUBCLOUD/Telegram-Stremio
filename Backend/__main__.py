@@ -6,19 +6,17 @@ from pyrogram import idle
 from Backend import __version__, db
 from Backend.helper.pinger import ping
 from Backend.logger import LOGGER
-from Backend.config import Telegram
 from Backend.fastapi import server
+from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.pyro import restart_notification, setup_bot_commands
-from Backend.pyrofork.bot import Helper, StreamBot
+from Backend.pyrofork.bot import Userbot, StreamBot
 from Backend.pyrofork.clients import initialize_clients
-from Backend.pyrofork.plugins.channels import _load_channels_from_db
-from Backend.helper.subscription_checker import subscription_checker_loop
+from Backend.helper import subscription_task_manager
+from Backend.helper.scan_manager import scan_manager, dbcheck_manager
 from Backend.helper.link_checker import DeadLinkChecker
 from Backend.fastapi.main import app
 from Backend.helper.auto_catalog import (
-    start_auto_catalog_sync_background, start_auto_catalog_interval_loop,
-    AUTO_SYNC_DELAY_SECONDS, AUTO_CATALOG_ON_STARTUP,
-    AUTO_CATALOG_FULL_REBUILD_ON_STARTUP
+    start_auto_catalog_sync_background, start_auto_catalog_interval_loop
 )
 
 
@@ -31,22 +29,38 @@ async def start_services():
         
         await db.connect()
         await asleep(1.2)
+
+        await SettingsManager.initialize(db)
+        await asleep(0.5)
         
+        try:
+            await scan_manager.load(db)
+            dbcheck_manager.bind_db(db)
+        except Exception as e:
+            LOGGER.error(f"Failed to restore scan manager state on startup: {e}")
+        await asleep(0.3)
+
+        try:
+            await db.reload_extra_databases(SettingsManager.current().extra_databases)
+        except Exception as e:
+            LOGGER.error(f"Failed to reconnect extra storage databases on startup: {e}")
+        await asleep(0.5)
+
         await StreamBot.start()
         StreamBot.username = StreamBot.me.username
         LOGGER.info(f"Bot Client : [@{StreamBot.username}]")
         await asleep(1.2)
 
-        await Helper.start()
-        Helper.username = Helper.me.username
-        LOGGER.info(f"Helper Bot Client : [@{Helper.username}]")
+        if Userbot is not None:
+            await Userbot.start()
+            Userbot.username = Userbot.me.username
+            LOGGER.info(f"Userbot Client : [@{Userbot.username}] (Global Search / fallback enabled)")
+        else:
+            LOGGER.info("Userbot not configured (USER_SESSION_STRING empty) — running with StreamBot only.")
         await asleep(1.2)
 
         LOGGER.info("Initializing Multi Clients...")
         await initialize_clients()
-        await asleep(2)
-
-        await _load_channels_from_db()
         await asleep(2)
         
         await setup_bot_commands(StreamBot)
@@ -60,18 +74,12 @@ async def start_services():
         link_checker_task = DeadLinkChecker(db, app, check_interval_hours=24)
         loop.create_task(link_checker_task.start())
 
-        if AUTO_CATALOG_ON_STARTUP:
-            loop.create_task(start_auto_catalog_sync_background(
-                db,
-                delay_seconds=AUTO_SYNC_DELAY_SECONDS,
-                full_rebuild=AUTO_CATALOG_FULL_REBUILD_ON_STARTUP,
-            ))
+        
+        loop.create_task(start_auto_catalog_sync_background(db, delay_seconds=20, full_rebuild=False))
 
         loop.create_task(start_auto_catalog_interval_loop(db))
-        
-        if Telegram.SUBSCRIPTION:
-            loop.create_task(subscription_checker_loop(StreamBot))
-            LOGGER.info("Subscription Checker Task Started.")
+
+        await subscription_task_manager.sync(StreamBot)
         
         LOGGER.info("Telegram-Stremio Started Successfully!")
         await idle()
@@ -89,7 +97,8 @@ async def stop_services():
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         await StreamBot.stop()
-        await Helper.stop()
+        if Userbot is not None:
+            await Userbot.stop()
 
         await db.disconnect()
         

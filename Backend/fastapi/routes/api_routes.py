@@ -1,9 +1,11 @@
 import asyncio
 import json
+from datetime import datetime
 from fastapi import Request, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from Backend import db, StartTime, __version__
 from Backend.logger import LOGGER
+from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.pyro import get_readable_time
 from Backend.helper.metadata import (
     search_movie_candidates,
@@ -20,6 +22,10 @@ from Backend.helper.auto_catalog import (
     get_auto_catalog_settings,
     update_auto_catalog_settings,
 )
+
+from Backend.helper.settings_manager import SettingsManager
+
+
 
 
 # --- API Routes for System Stats ---
@@ -574,8 +580,30 @@ async def manage_subscriber_api(user_id: int, payload: dict) -> dict:
             raise HTTPException(status_code=400, detail="Invalid action")
             
         success = await db.manage_subscriber(user_id, action, days)
+
+        # On revoke, also remove the user from the subscription group so the
+        # action takes effect immediately instead of waiting for the checker.
+        if success and action == "delete" and SettingsManager.current().subscription:
+            group_id = SettingsManager.current().subscription_group_id
+            if group_id:
+                try:
+                    # ban + unban kicks without permanently blocking re-join
+                    await StreamBot.ban_chat_member(group_id, user_id)
+                    await StreamBot.unban_chat_member(group_id, user_id)
+                except Exception as exc:
+                    LOGGER.warning(f"Revoke: could not remove user {user_id} from group: {exc}")
+
+        # Reflect the change immediately in the stremio membership cache.
         if success:
-            return {"status": "success", "message": "User subscription updated successfully"}
+            try:
+                from Backend.fastapi.routes.stremio_routes import invalidate_membership_cache
+                invalidate_membership_cache(user_id)
+            except Exception:
+                pass
+
+        if success:
+            verb = {"extend": "extended", "reduce": "reduced", "delete": "revoked"}.get(action, "updated")
+            return {"status": "success", "message": f"User subscription {verb} successfully"}
         else:
             raise HTTPException(status_code=404, detail="User not found or update failed")
     except HTTPException:
@@ -587,9 +615,6 @@ async def manage_subscriber_api(user_id: int, payload: dict) -> dict:
 # --- Access Management API ---
 
 async def get_all_tokens_api() -> dict:
-    from Backend import db
-    from Backend.config import Telegram
-    from datetime import datetime
     try:
         tokens = await db.get_all_api_tokens()
         now = datetime.utcnow()
@@ -597,7 +622,7 @@ async def get_all_tokens_api() -> dict:
 
         # Pre-load all subscribers into a dict keyed by user_id for O(1) lookup
         subscriber_map = {}       # user_id (str) -> user doc
-        if Telegram.SUBSCRIPTION:
+        if SettingsManager.current().subscription:
             try:
                 for u in await db.get_all_subscribers():
                     uid = str(u.get("_id"))
@@ -617,7 +642,7 @@ async def get_all_tokens_api() -> dict:
             return f"User {user_id}" if user_id else "Telegram User"
 
         def build_entry(user_id, user, token_doc):
-            """Build a unified access entry from optional user + token records."""
+            """ a unified access entry from optional user + token records."""
             expiry = None
             sub_status = None
             user_found = bool(user)
@@ -633,7 +658,7 @@ async def get_all_tokens_api() -> dict:
                     expiry = t_expiry
 
             # Determine status
-            if Telegram.SUBSCRIPTION:
+            if SettingsManager.current().subscription:
                 if not user_found:
                     is_expired = True
                 elif sub_status != "active":
@@ -659,7 +684,7 @@ async def get_all_tokens_api() -> dict:
                 "is_expired": is_expired,
                 "sub_status": sub_status,
                 "addon_url": (
-                    f"{Telegram.BASE_URL}/stremio/{token_str}/manifest.json"
+                    f"{SettingsManager.current().base_url}/stremio/{token_str}/manifest.json"
                     if token_str else None
                 ),
             }
@@ -965,3 +990,231 @@ async def update_auto_catalog_settings_api(payload: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings API
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_settings_api() -> dict:
+
+    data = SettingsManager.current().to_dict()
+    # Never expose the raw password — let the UI know whether one is set
+    data["admin_password_set"] = bool(data.get("admin_password"))
+    data["admin_password"] = ""
+
+    try:
+        data["database_list"] = db.get_database_list()
+    except Exception as e:
+        LOGGER.error(f"get_settings_api: could not load database list: {e}")
+        data["database_list"] = []
+
+    return {"settings": data}
+
+
+async def update_settings_api(payload: dict) -> dict:
+
+    # Empty password string → don't change it
+    if "admin_password" in payload and not str(payload["admin_password"]).strip():
+        del payload["admin_password"]
+
+    # ── Type coercion & validation ────────────────────────────────────────────
+    bool_keys = {"replace_mode", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both"}
+    for key in bool_keys:
+        if key in payload:
+            payload[key] = bool(payload[key])
+
+    list_str_keys = {"auth_channels", "multi_tokens", "extra_databases", "global_search_channels", "anime_channels"}
+    for key in list_str_keys:
+        if key in payload:
+            if not isinstance(payload[key], list):
+                raise HTTPException(status_code=400, detail=f"'{key}' must be a list.")
+            payload[key] = [str(v).strip() for v in payload[key] if str(v).strip()]
+
+    if "extra_databases" in payload:
+        for uri in payload["extra_databases"]:
+            if not uri.startswith(("mongodb://", "mongodb+srv://")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid database URI (must start with mongodb:// or mongodb+srv://): {uri[:30]}…"
+                )
+
+    if "approver_ids" in payload:
+        if not isinstance(payload["approver_ids"], list):
+            raise HTTPException(status_code=400, detail="'approver_ids' must be a list.")
+        try:
+            payload["approver_ids"] = [int(v) for v in payload["approver_ids"] if str(v).strip()]
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="All approver_ids must be integers.")
+
+    if "subscription_group_id" in payload:
+        try:
+            payload["subscription_group_id"] = int(payload["subscription_group_id"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="'subscription_group_id' must be an integer.")
+    if "global_search_channels" in payload:
+        cleaned = []
+        for channel in payload["global_search_channels"]:
+            channel = str(channel).strip()
+            if not channel:
+                continue
+            try:
+                int(channel)
+            except ValueError:
+                raise HTTPException(status_code=400,
+                    detail=f"Invalid channel id: {channel}"
+                    )
+            cleaned.append(channel)
+        payload["global_search_channels"] = cleaned
+
+    if "anime_channels" in payload:
+        cleaned = []
+        for channel in payload["anime_channels"]:
+            channel = str(channel).strip()
+            if not channel:
+                continue
+            try:
+                int(channel.replace("-100", ""))
+            except ValueError:
+                raise HTTPException(status_code=400,
+                    detail=f"Invalid anime channel id: {channel}"
+                    )
+            cleaned.append(channel)
+        payload["anime_channels"] = cleaned
+
+    # Strip whitespace from string fields
+    for key in ("tmdb_api", "base_url", "upstream_repo", "upstream_branch",
+                "admin_username", "admin_password", "http_proxy_url",
+                "payment_instructions", "payment_qr_url"):
+        if key in payload and isinstance(payload[key], str):
+            payload[key] = payload[key].strip()
+
+    try:
+        reinit_results = await SettingsManager.update(db, payload)
+        return {
+            "message": "Settings saved successfully.",
+            "reinit": reinit_results,
+        }
+    except ValueError as exc:
+        # Raised by db.reload_extra_databases() for unsafe/invalid DB changes
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tools — WebUI replacement for /scan, /rescan, /scanstatus, /cancelscan,
+#  /dbcheck. All driven from the Tools page; no bot commands remain.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scan_client():
+    """Pick a Telegram client capable of fetching channel messages.
+
+    Prefer the primary StreamBot (it must be an admin in the AUTH channels to
+    index them); fall back to any connected client."""
+    if StreamBot is not None:
+        return StreamBot
+    if multi_clients:
+        return multi_clients.get(0) or next(iter(multi_clients.values()))
+    return None
+
+
+async def get_tools_channels_api() -> dict:
+    """Return the configured AUTH channels with friendly names for the picker."""
+    channels = list(SettingsManager.current().auth_channels)
+    client = _scan_client()
+    result = []
+    for ch in channels:
+        name = str(ch)
+        try:
+            if client is not None:
+                chat = await client.get_chat(int(ch) if str(ch).lstrip("-").isdigit() else ch)
+                name = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(ch)
+        except Exception as e:
+            LOGGER.warning(f"[Tools] Could not resolve channel {ch}: {e}")
+        result.append({"id": str(ch), "name": name})
+    return {"status": "success", "data": result}
+
+
+async def start_scan_api(payload: dict) -> dict:
+    from Backend.helper.scan_manager import scan_manager
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+
+    mode = str(payload.get("mode", "scan")).lower()
+    if mode not in ("scan", "rescan"):
+        raise HTTPException(status_code=400, detail="mode must be 'scan' or 'rescan'.")
+    channels = payload.get("channels") or []
+    if not isinstance(channels, list):
+        raise HTTPException(status_code=400, detail="'channels' must be a list.")
+
+    result = await scan_manager.start(client, channels, mode=mode)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("message", "Could not start scan."))
+    return {"status": "success", **result}
+
+
+async def cancel_scan_api() -> dict:
+    from Backend.helper.scan_manager import scan_manager
+    result = await scan_manager.cancel()
+    return {"status": "success" if result.get("ok") else "error", **result}
+
+
+async def scan_status_api() -> dict:
+    from Backend.helper.scan_manager import scan_manager
+    return {"status": "success", "data": scan_manager.get_status()}
+
+
+async def start_dbcheck_api() -> dict:
+    from Backend.helper.scan_manager import dbcheck_manager
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+    result = await dbcheck_manager.start(client)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("message", "Could not start DB check."))
+    return {"status": "success", **result}
+
+
+async def cancel_dbcheck_api() -> dict:
+    from Backend.helper.scan_manager import dbcheck_manager
+    result = await dbcheck_manager.cancel()
+    return {"status": "success" if result.get("ok") else "error", **result}
+
+
+async def dbcheck_status_api() -> dict:
+    from Backend.helper.scan_manager import dbcheck_manager
+    return {"status": "success", "data": dbcheck_manager.get_status()}
+
+
+async def purge_dead_links_api(payload: dict | None = None) -> dict:
+    """Purge dead links.
+
+    - With no body (or {"source": "dbcheck"}): purge the dead entries found by
+      the most recent DB check.
+    - {"source": "flagged"}: purge every entry flagged is_dead in the DB
+      (these come from the background Dead-Link Checker).
+    - {"stream_ids": [...]}: purge a specific set.
+    """
+    from Backend.helper.scan_manager import dbcheck_manager
+    payload = payload or {}
+    source = str(payload.get("source", "dbcheck")).lower()
+    stream_ids = payload.get("stream_ids")
+
+    if stream_ids is not None:
+        result = await dbcheck_manager.purge(stream_ids)
+    elif source == "flagged":
+        try:
+            flagged = await db.get_all_dead_links()
+            ids = list({d.get("quality_id") for d in flagged if d.get("quality_id")})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not load flagged dead links: {e}")
+        result = await dbcheck_manager.purge(ids)
+    else:
+        result = await dbcheck_manager.purge()
+
+    return {"status": "success" if result.get("ok") else "error", **result}

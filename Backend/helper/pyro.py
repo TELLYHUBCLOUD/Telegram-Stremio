@@ -2,7 +2,7 @@ from pyrogram.file_id import FileId
 from typing import Optional
 from Backend.logger import LOGGER
 from Backend import __version__, now, timezone
-from Backend.config import Telegram
+from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.exceptions import FIleNotFound
 from aiofiles import open as aiopen
 from aiofiles.os import path as aiopath, remove as aioremove
@@ -13,11 +13,6 @@ from pyrogram.types import BotCommand
 from pyrogram import enums
 
 
-# ---------------------------------------------------------------------------
-# Pre-compiled patterns used in clean_filename
-# ---------------------------------------------------------------------------
-
-# Broad emoji / unicode-symbol regex (covers all major Unicode emoji blocks)
 _EMOJI_PATTERN = re.compile(
     "["
     "\U0001F600-\U0001F64F"   # emoticons
@@ -34,7 +29,6 @@ _EMOJI_PATTERN = re.compile(
     re.UNICODE,
 )
 
-# Decorative / non-filename characters that are not emojis but still break PTN
 _DECORATION_PATTERN = re.compile(
     r"[•·‣⁃◦⦿⦾❖✦✧✪✫✬✭✮★☆♦♣♠♥►◄→←↑↓»«|¦‖⟨⟩⌨⌚⌛⏰⏱⏲⏳✔✖✗✘✅❌❎⚠⛔🚫]+",
     re.UNICODE,
@@ -45,7 +39,6 @@ _CHANNEL_TAG_PATTERN = re.compile(
     r"_@[A-Za-z]+_|@[A-Za-z]+_|[\[\]\s@]*@[^.\s\[\]]+[\]\[\s@]*"
 )
 
-# Common audio/source tags that are *not* relevant to the title
 _CODEC_TAG_PATTERN = re.compile(
     r"(?<=\W)(org|AMZN|DDP|DD|NF|AAC|TVDL|5\.1|2\.1|2\.0|7\.0|7\.1|5\.0|~|\b\w+kbps\b)(?=\W)",
     re.IGNORECASE,
@@ -103,17 +96,6 @@ def get_readable_file_size(size_in_bytes):
 
 
 def clean_filename(filename: str) -> str:
-    """
-    Sanitise a raw Telegram caption / file name so PTN can parse it correctly.
-
-    Processing order:
-      1. Strip emoji sequences (they silently confuse PTN)
-      2. Strip decorative unicode punctuation (•, ★, »…)
-      3. Replace non-ASCII characters that survived with spaces
-      4. Remove Telegram channel / username tags
-      5. Remove common audio/source codec tags
-      6. Collapse whitespace
-    """
     if not filename:
         return "unknown_file"
 
@@ -190,7 +172,7 @@ async def restart_notification():
                 chat_id, msg_id = map(int, data)
 
             try:
-                repo = Telegram.UPSTREAM_REPO.split('/')
+                repo = SettingsManager.current().upstream_repo.split('/')
                 UPSTREAM_REPO = f"https://github.com/{repo[-2]}/{repo[-1]}"
                 await StreamBot.edit_message_text(
                     chat_id=chat_id,
@@ -201,7 +183,7 @@ async def restart_notification():
                         f"Time: {now.strftime('%I:%M:%S %p')}\n"
                         f"TimeZone: {timezone.zone}\n\n"
                         f"Repo: {UPSTREAM_REPO}\n"
-                        f"Branch: {Telegram.UPSTREAM_BRANCH}\n"
+                        f"Branch: {SettingsManager.current().upstream_branch}\n"
                         f"Version: {__version__}"
                     ),
                     parse_mode=enums.ParseMode.HTML
@@ -219,14 +201,7 @@ async def restart_notification():
 commands = [
     BotCommand("start", "🚀 Start the bot"),
     BotCommand("set", "🎬 Manually add IMDb metadata"),
-    BotCommand("channels", "📡 List AUTH channels"),
-    BotCommand("addchannel", "➕ Add a channel"),
-    BotCommand("removechannel", "➖ Remove a channel"),
-    BotCommand("scan", "🔍 Scan channel content"),
-    BotCommand("search", "🔎 Search DB by title"),
     BotCommand("stats", "📊 DB and system stats"),
-    BotCommand("dbcheck", "🩺 Check DB integrity"),
-    # BotCommand("fixmetadata", "⚙️ Fix empty fields of Metadata"),
     BotCommand("log", "📄 Send the log file"),
     BotCommand("restart", "♻️ Restart the bot"),
 ]

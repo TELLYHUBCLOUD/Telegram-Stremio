@@ -2,10 +2,12 @@ from fastapi import Request, Form, HTTPException, Depends
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from Backend.fastapi.security.credentials import verify_credentials, require_auth, is_authenticated, get_current_user
-from Backend.fastapi.themes import get_theme, get_all_themes
+from Backend.fastapi.themes import get_theme, get_all_themes, DEFAULT_THEME
 from Backend import db
+from Backend.config import Telegram
 from Backend.pyrofork.bot import work_loads, multi_clients, StreamBot
 from Backend.helper.pyro import get_readable_time
+from Backend.helper.settings_manager import SettingsManager
 from Backend import StartTime, __version__
 import time
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
@@ -13,7 +15,7 @@ from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
 templates = Jinja2Templates(directory="Backend/fastapi/templates")
 
 async def admin_dashboard_page(request: Request, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
     
@@ -29,7 +31,7 @@ async def login_page(request: Request):
     if is_authenticated(request):
         return RedirectResponse(url="/", status_code=302)
     
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     
     return templates.TemplateResponse("login.html", {
@@ -45,7 +47,7 @@ async def login_post(request: Request, username: str = Form(...), password: str 
         request.session["username"] = username
         return RedirectResponse(url="/", status_code=302)
     else:
-        theme_name = request.session.get("theme", "dark_professional")
+        theme_name = request.session.get("theme", DEFAULT_THEME)
         theme = get_theme(theme_name)
         return templates.TemplateResponse("login.html", {
             "request": request,
@@ -65,7 +67,7 @@ async def set_theme(request: Request, theme: str = Form(...)):
     return RedirectResponse(url=request.headers.get("referer", "/"), status_code=302)
 
 async def dashboard_page(request: Request, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
     
@@ -159,7 +161,7 @@ async def dashboard_page(request: Request, _: bool = Depends(require_auth)):
 
 
 async def media_management_page(request: Request, media_type: str = "movie", _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
     
@@ -173,7 +175,7 @@ async def media_management_page(request: Request, media_type: str = "movie", _: 
     })
 
 async def edit_media_page(request: Request, tmdb_id: int, db_index: int, media_type: str, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
     
@@ -183,7 +185,10 @@ async def edit_media_page(request: Request, tmdb_id: int, db_index: int, media_t
             raise HTTPException(status_code=404, detail="Media not found")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+    api_tokens = await db.get_all_api_tokens()
+    api_token = api_tokens[0].get("token") if api_tokens else None
+
     return templates.TemplateResponse("media_edit.html", {
         "request": request,
         "theme": theme,
@@ -193,11 +198,12 @@ async def edit_media_page(request: Request, tmdb_id: int, db_index: int, media_t
         "tmdb_id": tmdb_id,
         "db_index": db_index,
         "media_type": media_type,
-        "media_details": media_details
+        "media_details": media_details,
+        "api_token": api_token
     })
 
 async def public_status_page(request: Request):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     
     try:
@@ -229,7 +235,7 @@ async def public_status_page(request: Request):
     })
 
 async def stremio_guide_page(request: Request):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     
     return templates.TemplateResponse("stremio_guide.html", {
@@ -241,7 +247,7 @@ async def stremio_guide_page(request: Request):
     })
 
 async def admin_subscriptions_page(request: Request, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
     
@@ -255,7 +261,7 @@ async def admin_subscriptions_page(request: Request, _: bool = Depends(require_a
 
 
 async def admin_access_page(request: Request, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
 
@@ -270,7 +276,7 @@ async def admin_access_page(request: Request, _: bool = Depends(require_auth)):
 
 
 async def custom_catalogs_page(request: Request, _: bool = Depends(require_auth)):
-    theme_name = request.session.get("theme", "dark_professional")
+    theme_name = request.session.get("theme", DEFAULT_THEME)
     theme = get_theme(theme_name)
     current_user = get_current_user(request)
 
@@ -281,3 +287,50 @@ async def custom_catalogs_page(request: Request, _: bool = Depends(require_auth)
         "current_theme": theme_name,
         "current_user": current_user,
     })
+
+
+
+async def tools_page(request: Request, _: bool = Depends(require_auth)):
+    theme_name = request.session.get("theme", DEFAULT_THEME)
+    theme = get_theme(theme_name)
+    current_user = get_current_user(request)
+
+    return templates.TemplateResponse(
+        "tools.html",
+        {
+            "request": request,
+            "theme": theme,
+            "themes": get_all_themes(),
+            "current_theme": theme_name,
+            "current_user": current_user,
+        },
+    )
+
+
+async def settings_page(request: Request, _: bool = Depends(require_auth)):
+    theme_name = request.session.get("theme", DEFAULT_THEME)
+    theme = get_theme(theme_name)
+    current_user = get_current_user(request)
+
+    settings = SettingsManager.current().to_dict()
+    settings["admin_password"] = ""
+
+    try:
+        settings["database_list"] = db.get_database_list()
+    except Exception:
+        settings["database_list"] = []
+
+    userbot_configured = bool(Telegram.USER_SESSION_STRING and Telegram.USER_SESSION_STRING.strip())
+
+    return templates.TemplateResponse(
+        "settings.html",
+        {
+            "request": request,
+            "theme": theme,
+            "themes": get_all_themes(),
+            "current_theme": theme_name,
+            "current_user": current_user,
+            "settings": settings,
+            "userbot_configured": userbot_configured,
+        },
+)

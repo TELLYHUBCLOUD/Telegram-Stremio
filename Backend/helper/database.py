@@ -10,10 +10,12 @@ from typing import Dict, List, Optional, Tuple, Any
 
 from Backend.logger import LOGGER
 from Backend.config import Telegram
+from Backend.helper.settings_manager import SettingsManager
 import re
-from Backend.helper.encrypt import decode_string
-from Backend.helper.modal import Episode, MovieSchema, QualityDetail, Season, TVShowSchema
+from Backend.helper.encrypt import decode_string, encode_string
+from Backend.helper.modal import Episode, MovieSchema, QualityDetail, QualityPart, Season, TVShowSchema
 from Backend.helper.task_manager import delete_message
+
 
 
 def convert_objectid_to_str(document: Dict[str, Any]) -> Dict[str, Any]:
@@ -77,6 +79,110 @@ class Database:
             {"$set": {"current_index": self.current_db_index}},
             upsert=True
         )
+
+
+    async def get_settings(self) -> dict:
+        try:
+            doc = await self.dbs["tracking"]["settings"].find_one({"_id": "app_settings"})
+            return doc or {}
+        except Exception as e:
+            LOGGER.error(f"Database.get_settings error: {e}")
+            return {}
+
+    async def save_settings(self, settings: dict) -> bool:
+        try:
+            clean = {k: v for k, v in settings.items() if k != "_id"}
+            await self.dbs["tracking"]["settings"].update_one(
+                {"_id": "app_settings"},
+                {"$set": clean},
+                upsert=True,
+            )
+            return True
+        except Exception as e:
+            LOGGER.error(f"Database.save_settings error: {e}")
+            return False
+
+
+
+    async def connect_storage_db(self, uri: str, index: int) -> bool:
+        try:
+            client = motor.motor_asyncio.AsyncIOMotorClient(uri)
+            await client.admin.command("ping")
+
+            db_key = "tracking" if index == 0 else f"storage_{index}"
+            self.clients[db_key] = client
+            self.dbs[db_key] = client[self.db_name]
+
+            db_type = "Tracking" if index == 0 else f"Storage {index}"
+            masked_uri = re.sub(r"://(.*?):.*?@", r"://\1:*****@", uri).split('?')[0]
+            LOGGER.info(f"{db_type} Database connected successfully: {masked_uri}")
+            return True
+        except Exception as e:
+            LOGGER.error(f"Failed to connect database at index {index}: {e}")
+            return False
+
+    async def disconnect_storage_db(self, index: int) -> None:
+        db_key = f"storage_{index}"
+        client = self.clients.pop(db_key, None)
+        self.dbs.pop(db_key, None)
+        if client:
+            client.close()
+            LOGGER.info(f"Disconnected {db_key}.")
+
+    def get_database_list(self) -> List[Dict[str, Any]]:
+        result = []
+        for index, uri in enumerate(self.db_uris):
+            masked = re.sub(r"://(.*?):.*?@", r"://\1:*****@", uri).split('?')[0]
+            db_key = "tracking" if index == 0 else f"storage_{index}"
+            entry = {
+                "index": index,
+                "uri_masked": masked,
+                "locked": index <= 1,
+                "type": "tracking" if index == 0 else "storage",
+                "connected": db_key in self.clients,
+            }
+            if index > 1:
+                entry["full_uri"] = uri
+            result.append(entry)
+        return result
+
+    async def reload_extra_databases(self, new_extra_uris: List[str]) -> Dict[str, Any]:
+        old_extra = self.db_uris[2:]
+        new_extra = [u.strip() for u in (new_extra_uris or []) if u and u.strip()]
+
+        common_len = min(len(old_extra), len(new_extra))
+        for i in range(common_len):
+            if old_extra[i] != new_extra[i]:
+                raise ValueError(
+                    f"Cannot modify storage_{i + 2} in place — existing media "
+                    f"documents reference it by position. Only appending new "
+                    f"databases or removing the last one(s) is supported."
+                )
+
+        added = 0
+        removed = 0
+
+        if len(new_extra) > len(old_extra):
+            for offset, uri in enumerate(new_extra[len(old_extra):]):
+                index = len(old_extra) + 2 + offset
+                ok = await self.connect_storage_db(uri, index)
+                if not ok:
+                    raise ValueError(
+                        f"Failed to connect new database at storage_{index}. "
+                        f"Check the URI and try again — no changes were saved."
+                    )
+                added += 1
+
+        elif len(new_extra) < len(old_extra):
+            for index in range(len(old_extra) + 1, len(new_extra) + 1, -1):
+                await self.disconnect_storage_db(index)
+                removed += 1
+
+        self.db_uris = self.db_uris[:2] + new_extra
+
+        message = f"{added} database(s) added, {removed} database(s) removed."
+        LOGGER.info(f"reload_extra_databases: {message}")
+        return {"added": added, "removed": removed, "message": message}
 
     # -------------------------------
     # User Subscription Management
@@ -212,43 +318,47 @@ class Database:
         return [convert_objectid_to_str(u) for u in users]
 
     async def manage_subscriber(self, user_id: int, action: str, days: int = 0) -> bool:
-        user = await self.get_user(user_id)
-        if not user:
-            return False
-            
+        from datetime import timedelta
         now = datetime.utcnow()
-        if action == "extend" or action == "reduce":
-            from datetime import timedelta
-            current_expiry = user.get("subscription_expiry")
-            
+        user = await self.get_user(user_id)
+
+        if action in ("extend", "reduce"):
+            current_expiry = user.get("subscription_expiry") if user else None
+
             if action == "extend":
-                if current_expiry and current_expiry > now:
-                    new_expiry = current_expiry + timedelta(days=days)
-                else:
-                    new_expiry = now + timedelta(days=days)
-            else: # reduce
+                base = current_expiry if (current_expiry and current_expiry > now) else now
+                new_expiry = base + timedelta(days=days)
+            else:
                 if current_expiry:
                     new_expiry = current_expiry - timedelta(days=days)
                     if new_expiry < now:
-                        new_expiry = now # Just expire them
+                        new_expiry = now
                 else:
-                    new_expiry = now # Already expired or none
-            
+                    new_expiry = now
+
             status = "active" if new_expiry > now else "expired"
-            
-            result = await self.dbs["tracking"]["users"].update_one(
+
+            await self.dbs["tracking"]["users"].update_one(
                 {"_id": user_id},
-                {"$set": {"subscription_expiry": new_expiry, "subscription_status": status}}
+                {
+                    "$set": {"subscription_expiry": new_expiry, "subscription_status": status},
+                    "$setOnInsert": {
+                        "first_name": f"User {user_id}",
+                        "username": None,
+                        "created_at": now,
+                    },
+                },
+                upsert=True
             )
-            return result.modified_count > 0
-            
+            return True
+
         elif action == "delete":
-            result = await self.dbs["tracking"]["users"].update_one(
+            await self.dbs["tracking"]["users"].update_one(
                 {"_id": user_id},
-                {"$unset": {"subscription_expiry": "", "subscription_status": ""}}
+                {"$set": {"subscription_status": "expired", "subscription_expiry": now}}
             )
-            return result.modified_count > 0
-            
+            return True
+
         return False
 
     async def assign_subscription(self, user_id: int, days: int) -> dict:
@@ -288,9 +398,6 @@ class Database:
             "subscription_status": "active",
             "days_assigned": days,
         }
-
-
-
 
     # -------------------------------
     # Custom Catalog Management
@@ -402,6 +509,83 @@ class Database:
             return result.modified_count > 0
         except Exception:
             return False
+
+    async def find_media_doc(self, media_type: str, tmdb_id: int) -> Optional[Tuple[dict, int]]:
+        """Locate a media doc by tmdb_id across storage DBs.
+
+        Returns (doc, db_index) using the storage DB the doc physically lives
+        in (not the possibly-stale db_index field), or None if not found.
+        """
+        collection_name = "tv" if str(media_type).lower() in ["tv", "series"] else "movie"
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+
+        for i in range(1, self.current_db_index + 1):
+            db_key = f"storage_{i}"
+            if db_key not in self.dbs:
+                continue
+            doc = await self.dbs[db_key][collection_name].find_one({"tmdb_id": tmdb_id})
+            if doc:
+                doc["db_index"] = i
+                return doc, i
+        return None
+
+    async def purge_media_from_catalogs(self, tmdb_id: int, media_type: str) -> int:
+        """Remove a media item from every catalog (auto + manual).
+
+        Called when a movie/TV doc is fully deleted so dead entries do not
+        linger in any catalog. Matches on tmdb_id + media_type only (db_index
+        omitted) so stale indexes are still cleaned up. Keeps item_count in
+        sync via an aggregation-pipeline update.
+        """
+        if tmdb_id in (None, "", 0):
+            return 0
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return 0
+
+        media_type = "tv" if str(media_type).lower() in ["tv", "series"] else "movie"
+        collection = self.dbs["tracking"]["custom_catalogs"]
+        now = datetime.utcnow()
+        try:
+            result = await collection.update_many(
+                {"items": {"$elemMatch": {"tmdb_id": tmdb_id, "media_type": media_type}}},
+                [
+                    {
+                        "$set": {
+                            "items": {
+                                "$filter": {
+                                    "input": "$items",
+                                    "as": "it",
+                                    "cond": {
+                                        "$not": [
+                                            {
+                                                "$and": [
+                                                    {"$eq": ["$$it.tmdb_id", tmdb_id]},
+                                                    {"$eq": ["$$it.media_type", media_type]},
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    {"$set": {"item_count": {"$size": "$items"}, "updated_at": now}},
+                ],
+            )
+            if result.modified_count:
+                LOGGER.info(
+                    f"Purged {media_type} tmdb_id {tmdb_id} from "
+                    f"{result.modified_count} catalog(s)."
+                )
+            return result.modified_count
+        except Exception as e:
+            LOGGER.error(f"Failed to purge tmdb_id {tmdb_id} from catalogs: {e}")
+            return 0
 
     async def custom_catalog_contains_item(
         self, catalog_id: str, tmdb_id: int, db_index: int, media_type: str
@@ -555,11 +739,116 @@ class Database:
     # Multi Database Method for insert/update/delete/list
     # -------------------------------
 
+    async def _build_part_id_and_size(self, parts: List[dict]) -> Tuple[str, str]:
+        sorted_parts = sorted(parts, key=lambda p: p.get("part_number", 0))
+        payload = {"parts": [{"chat_id": p["chat_id"], "msg_id": p["msg_id"]} for p in sorted_parts]}
+        encoded = await encode_string(payload)
+        total_bytes = sum(p.get("size_bytes", 0) for p in sorted_parts)
+        from Backend.helper.pyro import get_readable_file_size 
+        size_str = get_readable_file_size(total_bytes)
+        return encoded, size_str
+
+    async def remove_media_part(self, channel: int, msg_id: int) -> bool:
+        try:
+            legacy_hash = await encode_string({"chat_id": channel, "msg_id": msg_id})
+            if await self.delete_media_by_stream_id(legacy_hash):
+                return True
+        except Exception as e:
+            LOGGER.error(f"remove_media_part: legacy lookup failed: {e}")
+
+        for i in range(1, self.current_db_index + 1):
+            db = self.dbs[f"storage_{i}"]
+
+            movie = await db["movie"].find_one(
+                {"telegram.parts": {"$elemMatch": {"chat_id": channel, "msg_id": msg_id}}}
+            )
+            if movie:
+                new_telegram = []
+                for q in movie.get("telegram", []):
+                    parts = q.get("parts")
+                    if parts and any(p.get("chat_id") == channel and p.get("msg_id") == msg_id for p in parts):
+                        remaining = [p for p in parts if not (p.get("chat_id") == channel and p.get("msg_id") == msg_id)]
+                        if not remaining:
+                            continue  # last part removed: drop the whole quality entry
+                        new_id, new_size = await self._build_part_id_and_size(remaining)
+                        q["parts"] = remaining
+                        q["id"] = new_id
+                        q["size"] = new_size
+                    new_telegram.append(q)
+
+                if len(new_telegram) == 0:
+                    await db["movie"].delete_one({"_id": movie["_id"]})
+                    await self.purge_media_from_catalogs(movie.get("tmdb_id"), "movie")
+                else:
+                    movie["telegram"] = new_telegram
+                    movie["updated_on"] = datetime.utcnow()
+                    await db["movie"].replace_one({"_id": movie["_id"]}, movie)
+                return True
+
+            tv = await db["tv"].find_one(
+                {"seasons.episodes.telegram.parts": {"$elemMatch": {"chat_id": channel, "msg_id": msg_id}}}
+            )
+            if tv:
+                for season in tv.get("seasons", []):
+                    for episode in season.get("episodes", []):
+                        new_telegram = []
+                        for q in episode.get("telegram", []):
+                            parts = q.get("parts")
+                            if parts and any(p.get("chat_id") == channel and p.get("msg_id") == msg_id for p in parts):
+                                remaining = [p for p in parts if not (p.get("chat_id") == channel and p.get("msg_id") == msg_id)]
+                                if not remaining:
+                                    continue
+                                new_id, new_size = await self._build_part_id_and_size(remaining)
+                                q["parts"] = remaining
+                                q["id"] = new_id
+                                q["size"] = new_size
+                            new_telegram.append(q)
+                        episode["telegram"] = new_telegram
+                    season["episodes"] = [e for e in season.get("episodes", []) if e.get("telegram")]
+                tv["seasons"] = [s for s in tv.get("seasons", []) if s.get("episodes")]
+
+                if len(tv["seasons"]) == 0:
+                    await db["tv"].delete_one({"_id": tv["_id"]})
+                    await self.purge_media_from_catalogs(tv.get("tmdb_id"), "tv")
+                else:
+                    tv["updated_on"] = datetime.utcnow()
+                    await db["tv"].replace_one({"_id": tv["_id"]}, tv)
+                return True
+
+        return False
+
     async def insert_media(
         self, metadata_info: dict,
-        channel: int, msg_id: int, size: str, name: str
+        channel: int, msg_id: int, size: str, name: str, raw_size: int = 0
     ) -> Optional[ObjectId]:
-        
+
+        group_key = metadata_info.get("group_key")
+        part_number = metadata_info.get("part_number")
+
+        if group_key:
+            part = {
+                "part_number": part_number or 1,
+                "chat_id": channel,
+                "msg_id": msg_id,
+                "size_bytes": raw_size,
+            }
+            part_id, part_size = await self._build_part_id_and_size([part])
+            quality_detail = QualityDetail(
+                quality=metadata_info['quality'],
+                id=part_id,
+                name=name,
+                size=part_size,
+                group_key=group_key,
+                parts=[QualityPart(**part)],
+            )
+        else:
+            quality_detail = QualityDetail(
+                quality=metadata_info['quality'],
+                id=metadata_info['encoded_string'],
+                name=name,
+                size=size,
+            )
+
         if metadata_info['media_type'] == "movie":
             media = MovieSchema(
                 tmdb_id=metadata_info['tmdb_id'],
@@ -576,12 +865,10 @@ class Database:
                 cast=metadata_info['cast'],
                 runtime=metadata_info['runtime'],
                 media_type=metadata_info['media_type'],
-                telegram=[QualityDetail(
-                    quality=metadata_info['quality'],
-                    id=metadata_info['encoded_string'],
-                    name=name,
-                    size=size
-                )]
+                is_anime=metadata_info.get('is_anime', False),
+                original_language=metadata_info.get('original_language'),
+                origin_country=metadata_info.get('origin_country', []) or [],
+                telegram=[quality_detail]
             )
             return await self.update_movie(media)
         else:
@@ -600,6 +887,9 @@ class Database:
                 cast=metadata_info['cast'],
                 runtime=metadata_info['runtime'],
                 media_type=metadata_info['media_type'],
+                is_anime=metadata_info.get('is_anime', False),
+                original_language=metadata_info.get('original_language'),
+                origin_country=metadata_info.get('origin_country', []) or [],
                 seasons=[Season(
                     season_number=metadata_info['season_number'],
                     episodes=[Episode(
@@ -608,16 +898,119 @@ class Database:
                         episode_backdrop=metadata_info['episode_backdrop'],
                         overview=metadata_info['episode_overview'],
                         released=metadata_info['episode_released'],
-                        telegram=[QualityDetail(
-                            quality=metadata_info['quality'],
-                            id=metadata_info['encoded_string'],
-                            name=name,
-                            size=size
-                        )]
+                        telegram=[quality_detail]
                     )]
                 )]
             )
             return await self.update_tv_show(tv_show)
+
+    async def _delete_split_part(self, part: dict) -> None:
+        try:
+            chat_id = int(f"-100{part['chat_id']}")
+            msg_id = int(part["msg_id"])
+            create_task(delete_message(chat_id, msg_id))
+        except Exception as e:
+            LOGGER.error(f"Failed to delete split part message: {e}")
+
+    async def _merge_split_part(self, qualities: List[dict], quality_to_update: dict) -> List[dict]:
+        group_key = quality_to_update.get("group_key")
+        incoming_parts = quality_to_update.get("parts") or []
+        if not incoming_parts:
+            return qualities + [quality_to_update]
+        new_part = incoming_parts[0]
+        replace_mode = SettingsManager.current().replace_mode
+
+        merged = False
+        result = []
+        for q in qualities:
+            if group_key is not None and q.get("group_key") == group_key:
+                existing_parts = q.get("parts") or []
+
+                if replace_mode:
+                    for old_part in existing_parts:
+                        if old_part.get("part_number") != new_part.get("part_number"):
+                            continue
+                        if (
+                            old_part.get("chat_id") == new_part.get("chat_id")
+                            and old_part.get("msg_id") == new_part.get("msg_id")
+                        ):
+                            continue
+                        await self._delete_split_part(old_part)
+
+                existing_parts = [
+                    p for p in existing_parts if p.get("part_number") != new_part.get("part_number")
+                ]
+                existing_parts.append(new_part)
+                new_id, new_size = await self._build_part_id_and_size(existing_parts)
+                q["parts"] = existing_parts
+                q["id"] = new_id
+                q["size"] = new_size
+                q["name"] = quality_to_update.get("name", q.get("name"))
+                merged = True
+            result.append(q)
+
+        if not merged:
+            result.append(quality_to_update)
+        return result
+
+    async def _delete_quality_media(self, quality: dict) -> None:
+        parts = quality.get("parts")
+        if parts:
+            for part in parts:
+                await self._delete_split_part(part)
+            return
+
+        old_id = quality.get("id")
+        if not old_id:
+            return
+        try:
+            decoded = await decode_string(old_id)
+            chat_id = int(f"-100{decoded['chat_id']}")
+            msg_id = int(decoded["msg_id"])
+            create_task(delete_message(chat_id, msg_id))
+        except Exception as e:
+            LOGGER.error(f"Failed to delete old quality message: {e}")
+
+    async def _apply_quality_update(
+        self, existing_qualities: List[dict], quality_to_update: dict
+    ) -> List[dict]:
+        target_quality = quality_to_update.get("quality")
+        incoming_group_key = quality_to_update.get("group_key")
+        replace_mode = SettingsManager.current().replace_mode
+
+        if incoming_group_key:
+            # Incoming is a split part.
+            if replace_mode:
+                stale = [
+                    q for q in existing_qualities
+                    if q.get("quality") == target_quality
+                    and q.get("group_key") != incoming_group_key
+                ]
+                for q in stale:
+                    await self._delete_quality_media(q)
+                existing_qualities = [
+                    q for q in existing_qualities
+                    if not (
+                        q.get("quality") == target_quality
+                        and q.get("group_key") != incoming_group_key
+                    )
+                ]
+            return await self._merge_split_part(existing_qualities, quality_to_update)
+
+        # Incoming is a normal (non-split) file.
+        if replace_mode:
+            stale = [q for q in existing_qualities if q.get("quality") == target_quality]
+            for q in stale:
+                await self._delete_quality_media(q)
+            existing_qualities = [
+                q for q in existing_qualities if q.get("quality") != target_quality
+            ]
+            existing_qualities.append(quality_to_update)
+            return existing_qualities
+
+        # REPLACE_MODE off: allow duplicate qualities.
+        existing_qualities.append(quality_to_update)
+        return existing_qualities
 
     async def update_movie(self, movie_data: MovieSchema) -> Optional[ObjectId]:
         try:
@@ -632,7 +1025,6 @@ class Database:
         release_year = movie_dict["release_year"]
 
         quality_to_update = movie_dict["telegram"][0]
-        target_quality = quality_to_update["quality"]
 
         current_db_key = f"storage_{self.current_db_index}"
         total_storage_dbs = len(self.dbs) - 1
@@ -675,30 +1067,17 @@ class Database:
 
         # ---------------- UPDATE MOVIE ----------------
         movie_id = existing_movie["_id"]
+
+        if imdb_id and not existing_movie.get("imdb_id"):
+            existing_movie["imdb_id"] = imdb_id
+        if tmdb_id and not existing_movie.get("tmdb_id"):
+            existing_movie["tmdb_id"] = tmdb_id
+        if movie_dict.get("is_anime"):
+            existing_movie["is_anime"] = True
+
         existing_qualities = existing_movie.get("telegram", [])
 
-        if Telegram.REPLACE_MODE:
-            to_delete = [q for q in existing_qualities if q.get("quality") == target_quality]
-
-            for q in to_delete:
-                try:
-                    old_id = q.get("id")
-                    if old_id:
-                        decoded = await decode_string(old_id)
-                        chat_id = int(f"-100{decoded['chat_id']}")
-                        msg_id = int(decoded['msg_id'])
-                        create_task(delete_message(chat_id, msg_id))
-                except Exception as e:
-                    LOGGER.error(f"Failed to delete old quality: {e}")
-
-            existing_qualities = [
-                q for q in existing_qualities if q.get("quality") != target_quality
-            ]
-            existing_qualities.append(quality_to_update)
-
-        else:
-            # allow duplicate qualities
-            existing_qualities.append(quality_to_update)
+        existing_qualities = await self._apply_quality_update(existing_qualities, quality_to_update)
 
         existing_movie["telegram"] = existing_qualities
         existing_movie["updated_on"] = datetime.utcnow()
@@ -774,6 +1153,13 @@ class Database:
         # ---------------- UPDATE TV ----------------
         tv_id = existing_tv["_id"]
 
+        if imdb_id and not existing_tv.get("imdb_id"):
+            existing_tv["imdb_id"] = imdb_id
+        if tmdb_id and not existing_tv.get("tmdb_id"):
+            existing_tv["tmdb_id"] = tmdb_id
+        if tv_show_dict.get("is_anime"):
+            existing_tv["is_anime"] = True
+
         for season in tv_show_dict["seasons"]:
             existing_season = next(
                 (s for s in existing_tv["seasons"]
@@ -799,33 +1185,9 @@ class Database:
                 existing_episode.setdefault("telegram", [])
 
                 for quality in episode["telegram"]:
-                    target_quality = quality.get("quality")
-
-                    if Telegram.REPLACE_MODE:
-                        to_delete = [
-                            q for q in existing_episode["telegram"]
-                            if q.get("quality") == target_quality
-                        ]
-
-                        for q in to_delete:
-                            try:
-                                old_id = q.get("id")
-                                if old_id:
-                                    decoded = await decode_string(old_id)
-                                    chat_id = int(f"-100{decoded['chat_id']}")
-                                    msg_id = int(decoded['msg_id'])
-                                    create_task(delete_message(chat_id, msg_id))
-                            except Exception as e:
-                                LOGGER.error(f"Failed to delete old quality: {e}")
-
-                        existing_episode["telegram"] = [
-                            q for q in existing_episode["telegram"]
-                            if q.get("quality") != target_quality
-                        ]
-                        existing_episode["telegram"].append(quality)
-
-                    else:
-                        existing_episode["telegram"].append(quality)
+                    existing_episode["telegram"] = await self._apply_quality_update(
+                        existing_episode["telegram"], quality
+                    )
 
         existing_tv["updated_on"] = datetime.utcnow()
 
@@ -1092,6 +1454,32 @@ class Database:
                     return False
             raise
 
+    async def _queue_quality_deletion(self, quality: dict) -> None:
+        try:
+            old_id = quality.get("id")
+            if not old_id:
+                return
+
+            decoded_data = await decode_string(old_id)
+
+            # Split-file: a list of parts, each its own Telegram message.
+            if isinstance(decoded_data, dict) and decoded_data.get("parts"):
+                for part in decoded_data["parts"]:
+                    try:
+                        chat_id = int(f"-100{part['chat_id']}")
+                        msg_id = int(part["msg_id"])
+                        create_task(delete_message(chat_id, msg_id))
+                    except Exception as e:
+                        LOGGER.error(f"Failed to queue split-file part for deletion: {e}")
+                return
+
+            
+            chat_id = int(f"-100{decoded_data['chat_id']}")
+            msg_id = int(decoded_data["msg_id"])
+            create_task(delete_message(chat_id, msg_id))
+        except Exception as e:
+            LOGGER.error(f"Failed to queue file for deletion: {e}")
+
     async def delete_document(self, media_type: str, tmdb_id: int, db_index: int) -> bool:
         db_key = f"storage_{db_index}"
 
@@ -1099,15 +1487,7 @@ class Database:
             doc = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
             if doc and "telegram" in doc:
                 for quality in doc["telegram"]:
-                    try:
-                        old_id = quality.get("id")
-                        if old_id:
-                            decoded_data = await decode_string(old_id)
-                            chat_id = int(f"-100{decoded_data['chat_id']}")
-                            msg_id = int(decoded_data['msg_id'])
-                            create_task(delete_message(chat_id, msg_id))
-                    except Exception as e:
-                        LOGGER.error(f"Failed to queue file for deletion: {e}")
+                    await self._queue_quality_deletion(quality)
             
             result = await self.dbs[db_key]["movie"].delete_one({"tmdb_id": tmdb_id})
         else:
@@ -1116,27 +1496,18 @@ class Database:
                 for season in doc["seasons"]:
                     for episode in season.get("episodes", []):
                         for quality in episode.get("telegram", []):
-                            try:
-                                old_id = quality.get("id")
-                                if old_id:
-                                    decoded_data = await decode_string(old_id)
-                                    chat_id = int(f"-100{decoded_data['chat_id']}")
-                                    msg_id = int(decoded_data['msg_id'])
-                                    create_task(delete_message(chat_id, msg_id))
-                            except Exception as e:
-                                LOGGER.error(f"Failed to queue file for deletion: {e}")
+                            await self._queue_quality_deletion(quality)
             
             result = await self.dbs[db_key]["tv"].delete_one({"tmdb_id": tmdb_id})
         
         if result.deleted_count > 0:
+            await self.purge_media_from_catalogs(tmdb_id, "tv" if media_type != "Movie" else "movie")
             LOGGER.info(f"{media_type} with tmdb_id {tmdb_id} deleted successfully.")
             return True
         LOGGER.info(f"No document found with tmdb_id {tmdb_id}.")
         return False
 
     async def get_title_by_stream_id(self, stream_id_hash: str) -> Optional[str]:
-        """Look up the original media title across all storage DBs using the telegram file ID hash.
-        For TV shows, it includes the Season and Episode number in the title."""
         for i in range(1, self.current_db_index + 1):
             db = self.dbs[f"storage_{i}"]
             
@@ -1162,8 +1533,6 @@ class Database:
         return None
 
     async def delete_media_by_stream_id(self, stream_id_hash: str) -> bool:
-        """Finds and removes a specific stream quality by its hash across all DBs. 
-        If it's the last quality, it cleans up the movie or episode/season/show."""
         for i in range(1, self.current_db_index + 1):
             db = self.dbs[f"storage_{i}"]
             
@@ -1173,6 +1542,7 @@ class Database:
                 movie["telegram"] = [q for q in movie.get("telegram", []) if q.get("id") != stream_id_hash]
                 if len(movie["telegram"]) == 0:
                     await db["movie"].delete_one({"_id": movie["_id"]})
+                    await self.purge_media_from_catalogs(movie.get("tmdb_id"), "movie")
                 else:
                     movie['updated_on'] = datetime.utcnow()
                     await db["movie"].replace_one({"_id": movie["_id"]}, movie)
@@ -1192,6 +1562,7 @@ class Database:
                                         tv["seasons"] = [s for s in tv.get("seasons", []) if s.get("season_number") != season.get("season_number")]
                                         if len(tv["seasons"]) == 0:
                                             await db["tv"].delete_one({"_id": tv["_id"]})
+                                            await self.purge_media_from_catalogs(tv.get("tmdb_id"), "tv")
                                             return True
                                 tv['updated_on'] = datetime.utcnow()
                                 await db["tv"].replace_one({"_id": tv["_id"]}, tv)
@@ -1207,15 +1578,7 @@ class Database:
 
         for q in movie["telegram"]:
             if q.get("id") == id:
-                try:
-                    old_id = q.get("id")
-                    if old_id:
-                        decoded_data = await decode_string(old_id)
-                        chat_id = int(f"-100{decoded_data['chat_id']}")
-                        msg_id = int(decoded_data['msg_id'])
-                        create_task(delete_message(chat_id, msg_id))
-                except Exception as e:
-                    LOGGER.error(f"Failed to queue file for deletion: {e}")
+                await self._queue_quality_deletion(q)
                 break
         
         original_len = len(movie["telegram"])
@@ -1241,15 +1604,7 @@ class Database:
                 for ep in season["episodes"]:
                     if ep.get("episode_number") == episode_number:
                         for quality in ep.get("telegram", []):
-                            try:
-                                old_id = quality.get("id")
-                                if old_id:
-                                    decoded_data = await decode_string(old_id)
-                                    chat_id = int(f"-100{decoded_data['chat_id']}")
-                                    msg_id = int(decoded_data['msg_id'])
-                                    create_task(delete_message(chat_id, msg_id))
-                            except Exception as e:
-                                LOGGER.error(f"Failed to queue file for deletion: {e}")
+                            await self._queue_quality_deletion(quality)
                         break
                 
                 original_len = len(season["episodes"])
@@ -1275,15 +1630,7 @@ class Database:
             if season.get("season_number") == season_number:
                 for episode in season.get("episodes", []):
                     for quality in episode.get("telegram", []):
-                        try:
-                            old_id = quality.get("id")
-                            if old_id:
-                                decoded_data = await decode_string(old_id)
-                                chat_id = int(f"-100{decoded_data['chat_id']}")
-                                msg_id = int(decoded_data['msg_id'])
-                                create_task(delete_message(chat_id, msg_id))
-                        except Exception as e:
-                            LOGGER.error(f"Failed to queue file for deletion: {e}")
+                        await self._queue_quality_deletion(quality)
                 break
         
         original_len = len(tv["seasons"])
@@ -1310,15 +1657,7 @@ class Database:
                     if episode.get("episode_number") == episode_number and "telegram" in episode:
                         for q in episode["telegram"]:
                             if q.get("id") == id:
-                                try:
-                                    old_id = q.get("id")
-                                    if old_id:
-                                        decoded_data = await decode_string(old_id)
-                                        chat_id = int(f"-100{decoded_data['chat_id']}")
-                                        msg_id = int(decoded_data['msg_id'])
-                                        create_task(delete_message(chat_id, msg_id))
-                                except Exception as e:
-                                    LOGGER.error(f"Failed to queue file for deletion: {e}")
+                                await self._queue_quality_deletion(q)
                                 break
                         
                         original_len = len(episode["telegram"])
@@ -1641,6 +1980,49 @@ class Database:
 
 
 
+    @staticmethod
+    def _merge_telegram_lists(primary: List[dict], secondary: List[dict]) -> List[dict]:
+        merged = list(primary or [])
+        existing_ids = {q.get("id") for q in merged if q.get("id")}
+        existing_groups = {q.get("group_key") for q in merged if q.get("group_key")}
+        for q in (secondary or []):
+            group_key = q.get("group_key")
+            if group_key and group_key in existing_groups:
+                continue
+            if q.get("id") and q.get("id") in existing_ids:
+                continue
+            merged.append(q)
+            if q.get("id"):
+                existing_ids.add(q.get("id"))
+            if group_key:
+                existing_groups.add(group_key)
+        return merged
+
+    def _merge_season_lists(self, primary: List[dict], secondary: List[dict]) -> List[dict]:
+        merged = list(primary or [])
+        season_map = {s.get("season_number"): s for s in merged}
+        for season in (secondary or []):
+            season_number = season.get("season_number")
+            target_season = season_map.get(season_number)
+            if not target_season:
+                merged.append(season)
+                season_map[season_number] = season
+                continue
+
+            target_season.setdefault("episodes", [])
+            episode_map = {e.get("episode_number"): e for e in target_season["episodes"]}
+            for episode in season.get("episodes", []):
+                episode_number = episode.get("episode_number")
+                target_episode = episode_map.get(episode_number)
+                if not target_episode:
+                    target_season["episodes"].append(episode)
+                    episode_map[episode_number] = episode
+                    continue
+                target_episode["telegram"] = self._merge_telegram_lists(
+                    target_episode.get("telegram", []), episode.get("telegram", [])
+                )
+        return merged
+
     async def replace_media_metadata(
         self,
         media_type: str,
@@ -1656,50 +2038,88 @@ class Database:
         if not current_doc:
             return None
 
-        current_doc.pop("_id", None)
+        source_id = current_doc["_id"]
+
+        def _pick(key: str):
+            new_value = metadata.get(key)
+            if new_value in (None, "", [], {}, 0, 0.0, "0"):
+                return current_doc.get(key)
+            return new_value
+
+        new_tmdb_id = int(metadata.get("tmdb_id") or tmdb_id)
+        new_imdb_id = _pick("imdb_id")
 
         if collection_name == "movie":
-            preserved_telegram = current_doc.get("telegram", [])
             current_doc.update({
-                "tmdb_id": int(metadata.get("tmdb_id") or tmdb_id),
-                "imdb_id": metadata.get("imdb_id"),
-                "title": metadata.get("title") or current_doc.get("title"),
-                "release_year": metadata.get("release_year", current_doc.get("release_year")),
-                "rating": metadata.get("rating", current_doc.get("rating")),
-                "description": metadata.get("description", current_doc.get("description")),
-                "poster": metadata.get("poster", current_doc.get("poster")),
-                "backdrop": metadata.get("backdrop", current_doc.get("backdrop")),
-                "logo": metadata.get("logo", current_doc.get("logo")),
-                "genres": metadata.get("genres", current_doc.get("genres", [])),
-                "cast": metadata.get("cast", current_doc.get("cast", [])),
-                "runtime": metadata.get("runtime", current_doc.get("runtime")),
+                "tmdb_id": new_tmdb_id,
+                "imdb_id": new_imdb_id,
+                "title": _pick("title"),
+                "release_year": _pick("release_year"),
+                "rating": _pick("rating"),
+                "description": _pick("description"),
+                "poster": _pick("poster"),
+                "backdrop": _pick("backdrop"),
+                "logo": _pick("logo"),
+                "genres": _pick("genres"),
+                "cast": _pick("cast"),
+                "runtime": _pick("runtime"),
                 "media_type": "movie",
-                "telegram": preserved_telegram,
+                "telegram": current_doc.get("telegram", []),
                 "updated_on": datetime.utcnow(),
             })
         else:
-            preserved_seasons = current_doc.get("seasons", [])
             current_doc.update({
-                "tmdb_id": int(metadata.get("tmdb_id") or tmdb_id) if metadata.get("tmdb_id") else int(tmdb_id),
-                "imdb_id": metadata.get("imdb_id"),
-                "title": metadata.get("title") or current_doc.get("title"),
-                "release_year": metadata.get("release_year", current_doc.get("release_year")),
-                "rating": metadata.get("rating", current_doc.get("rating")),
-                "description": metadata.get("description", current_doc.get("description")),
-                "poster": metadata.get("poster", current_doc.get("poster")),
-                "backdrop": metadata.get("backdrop", current_doc.get("backdrop")),
-                "logo": metadata.get("logo", current_doc.get("logo")),
-                "genres": metadata.get("genres", current_doc.get("genres", [])),
-                "cast": metadata.get("cast", current_doc.get("cast", [])),
-                "runtime": metadata.get("runtime", current_doc.get("runtime")),
+                "tmdb_id": new_tmdb_id,
+                "imdb_id": new_imdb_id,
+                "title": _pick("title"),
+                "release_year": _pick("release_year"),
+                "rating": _pick("rating"),
+                "description": _pick("description"),
+                "poster": _pick("poster"),
+                "backdrop": _pick("backdrop"),
+                "logo": _pick("logo"),
+                "genres": _pick("genres"),
+                "cast": _pick("cast"),
+                "runtime": _pick("runtime"),
                 "media_type": "tv",
-                "seasons": preserved_seasons,
+                "seasons": current_doc.get("seasons", []),
                 "updated_on": datetime.utcnow(),
             })
 
-        new_tmdb_id = int(current_doc["tmdb_id"])
-        await collection.delete_one({"tmdb_id": int(tmdb_id)})
-        await collection.insert_one(current_doc)
+        identity_filters = []
+        if new_imdb_id:
+            identity_filters.append({"imdb_id": new_imdb_id})
+        identity_filters.append({"tmdb_id": new_tmdb_id})
 
-        updated_doc = await collection.find_one({"tmdb_id": new_tmdb_id})
+        existing_other = await collection.find_one({
+            "$and": [{"$or": identity_filters}, {"_id": {"$ne": source_id}}]
+        })
+
+        if existing_other:
+            if collection_name == "movie":
+                existing_other["telegram"] = self._merge_telegram_lists(
+                    existing_other.get("telegram", []), current_doc.get("telegram", [])
+                )
+            else:
+                existing_other["seasons"] = self._merge_season_lists(
+                    existing_other.get("seasons", []), current_doc.get("seasons", [])
+                )
+
+            for field in (
+                "tmdb_id", "imdb_id", "title", "release_year", "rating",
+                "description", "poster", "backdrop", "logo", "genres",
+                "cast", "runtime", "media_type",
+            ):
+                if field in current_doc:
+                    existing_other[field] = current_doc[field]
+            existing_other["updated_on"] = datetime.utcnow()
+
+            await collection.delete_one({"_id": source_id})
+            await collection.replace_one({"_id": existing_other["_id"]}, existing_other)
+
+            updated_doc = await collection.find_one({"_id": existing_other["_id"]})
+            return convert_objectid_to_str(updated_doc) if updated_doc else None
+        await collection.replace_one({"_id": source_id}, current_doc)
+
+        updated_doc = await collection.find_one({"_id": source_id})
         return convert_objectid_to_str(updated_doc) if updated_doc else None
