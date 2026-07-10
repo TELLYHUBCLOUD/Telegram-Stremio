@@ -8,11 +8,14 @@ from pyrogram.types import Message
 
 import Backend
 from Backend import db
+from Backend.helper.announcer import announce_new_media
 from Backend.helper.auto_catalog import start_single_media_catalog_sync
+from Backend.helper.requests_manager import auto_fulfill
 from Backend.helper.metadata import extract_default_id, metadata
-from Backend.helper.pyro import clean_filename, get_readable_file_size, remove_urls
+from Backend.helper.pyro import clean_filename, finalize_media_name, get_readable_file_size
 from Backend.helper.settings_manager import SettingsManager
-from Backend.helper.split_files import parse_split_info, strip_part_suffix
+from Backend.helper.split_files import parse_split_info
+from Backend.helper.subtitles import ingest_subtitle, is_subtitle_file, remove_subtitle
 from Backend.helper.task_manager import edit_message
 from Backend.logger import LOGGER
 
@@ -34,6 +37,12 @@ def _is_supported_media(message: Message) -> bool:
     return False
 
 
+#----- True when a chat id belongs to a manual channel (files added by hand, not auto-indexed)
+def _is_manual_channel(chat_id) -> bool:
+    target = str(chat_id).replace("-100", "")
+    return any(str(c).strip().replace("-100", "") == target for c in SettingsManager.current().manual_channels)
+
+
 #----- Common message field extraction shared by the channel handlers
 def _extract_fields(message: Message):
     file = message.video or message.document
@@ -44,12 +53,7 @@ def _extract_fields(message: Message):
 
 #----- Strip URLs/part suffix from a title and ensure a video extension
 def _finalize_title(title: str, metadata_info: dict) -> str:
-    title = remove_urls(title)
-    if metadata_info.get('group_key'):
-        title = strip_part_suffix(title)
-    if not title.endswith(('.mkv', '.mp4')):
-        title += '.mkv'
-    return title
+    return finalize_media_name(title, bool(metadata_info.get('group_key')))
 
 
 #----- Serialize DB inserts from the queue and trigger catalog sync
@@ -68,6 +72,12 @@ async def process_file():
                 tmdb_id=metadata_info.get("tmdb_id"),
                 media_type=metadata_info.get("media_type"),
             )
+            announce_new_media(metadata_info)
+            create_task(auto_fulfill(
+                tmdb_id=metadata_info.get("tmdb_id"),
+                imdb_id=metadata_info.get("imdb_id"),
+                media_type=metadata_info.get("media_type"),
+            ))
         file_queue.task_done()
 
 
@@ -77,10 +87,18 @@ create_task(process_file())
 #----- Ingest new channel media into the queue after building metadata
 @Client.on_message(filters.channel & (filters.document | filters.video))
 async def file_receive_handler(client: Client, message: Message):
+    if _is_manual_channel(message.chat.id):
+        return
     if str(message.chat.id) not in SettingsManager.current().auth_channels:
         await message.reply_text("> Channel is not in AUTH_CHANNEL")
         return
     try:
+        sub_name = (message.document.file_name if message.document else "") or ""
+        if sub_name and is_subtitle_file(sub_name):
+            channel = str(message.chat.id).replace("-100", "")
+            create_task(ingest_subtitle(sub_name, int(channel), message.id))
+            return
+
         if not _is_supported_media(message):
             await message.reply_text("> Not supported")
             return
@@ -142,13 +160,17 @@ async def file_edited_handler(client: Client, message: Message):
 async def file_deleted_handler(client: Client, messages: list[Message]):
     try:
         for message in messages:
-            if not (message.chat and str(message.chat.id) in SettingsManager.current().auth_channels):
+            if not message.chat:
+                continue
+            if not (str(message.chat.id) in SettingsManager.current().auth_channels or _is_manual_channel(message.chat.id)):
                 continue
             channel = str(message.chat.id).replace("-100", "")
             msg_id = message.id
             try:
                 if await db.remove_media_part(int(channel), msg_id):
                     LOGGER.info(f"Automatically purged deleted message {msg_id} from database.")
+                if await remove_subtitle(int(channel), msg_id):
+                    LOGGER.info(f"Automatically purged deleted subtitle {msg_id} from database.")
             except Exception as ex:
                 LOGGER.error(f"Failed to scrub deleted message {msg_id}: {ex}")
     except Exception as e:

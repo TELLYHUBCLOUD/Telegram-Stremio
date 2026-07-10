@@ -14,8 +14,8 @@ _DEFAULTS: Dict[str, Any] = {
     "auth_channels": [],
     "tmdb_api": "",
     "base_url": "",
-    "upstream_repo": "",
-    "upstream_branch": "",
+    "upstream_repo": "https://github.com/weebzone/Telegram-Stremio",
+    "upstream_branch": "master",
     "admin_username": "admin",
     "admin_password": "admin",
     "session_secret": "",
@@ -31,6 +31,9 @@ _DEFAULTS: Dict[str, Any] = {
     "global_search": False,
     "global_search_channels": [],
     "anime_channels": [],
+    "manual_channels": [],
+    "announce_new_content": False,
+    "announcement_channel": "",
 }
 
 
@@ -97,6 +100,18 @@ class Settings:
     @property
     def anime_channels(self) -> List[str]:
         return list(self._d.get("anime_channels") or [])
+
+    @property
+    def manual_channels(self) -> List[str]:
+        return list(self._d.get("manual_channels") or [])
+
+    @property
+    def announce_new_content(self) -> bool:
+        return bool(self._d.get("announce_new_content", False))
+
+    @property
+    def announcement_channel(self) -> str:
+        return str(self._d.get("announcement_channel") or "").strip()
 
     #----- Strings
     @property

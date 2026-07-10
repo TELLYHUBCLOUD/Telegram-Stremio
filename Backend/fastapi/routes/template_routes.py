@@ -9,11 +9,13 @@ from Backend.config import Telegram
 from Backend.fastapi.security.credentials import get_current_user, is_authenticated, require_auth, verify_credentials
 from Backend.fastapi.themes import DEFAULT_THEME, get_all_themes, get_theme
 from Backend.helper.custom_dl import ACTIVE_STREAMS, RECENT_STREAMS
+from Backend.helper.metadata import resolve_cover_url
 from Backend.helper.pyro import get_readable_time
 from Backend.helper.settings_manager import SettingsManager
 from Backend.pyrofork.bot import StreamBot, multi_clients, work_loads_summary
 
 templates = Jinja2Templates(directory="Backend/fastapi/templates")
+templates.env.globals["cover_url"] = resolve_cover_url
 
 
 #----- Shared template context (request, theme metadata) for every page
@@ -220,6 +222,20 @@ async def admin_access_page(request: Request, _: bool = Depends(require_auth)):
     ctx = _base_context(request)
     ctx["current_user"] = get_current_user(request)
     return templates.TemplateResponse("access_manage.html", ctx)
+
+
+#----- Content requests shell (admin)
+async def admin_requests_page(request: Request, _: bool = Depends(require_auth)):
+    ctx = _base_context(request)
+    ctx["current_user"] = get_current_user(request)
+    return templates.TemplateResponse("requests_manage.html", ctx)
+
+
+#----- Public request page (no auth)
+async def public_request_page(request: Request):
+    ctx = _base_context(request)
+    ctx["is_authenticated"] = is_authenticated(request)
+    return templates.TemplateResponse("request_public.html", ctx)
 
 
 #----- Custom catalogs shell

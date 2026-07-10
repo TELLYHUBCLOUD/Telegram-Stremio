@@ -1,10 +1,15 @@
 import asyncio
+import asyncio
 import json
+import os
+import random
+import secrets
+import shutil
 from datetime import datetime
 from time import time
 
 from fastapi import HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from Backend import StartTime, __version__, db
 from Backend.fastapi.routes.stream_routes import _streamer_by_client
@@ -13,24 +18,40 @@ from Backend.helper.auto_catalog import (
     get_auto_catalog_settings,
     get_auto_catalog_sync_status,
     start_auto_catalog_sync_background,
+    start_single_media_catalog_sync,
     update_auto_catalog_settings,
 )
+from Backend.helper.backup import export_config, import_config
 from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, run_speed_test
-from Backend.helper.encrypt import decode_string
+from Backend.helper.encrypt import decode_string, encode_string
+from Backend.helper.health import run_health_checks
+from Backend.helper.manual_add import resolve_telegram_message
+from Backend.helper.requests_manager import (
+    delete_request,
+    list_requests,
+    popular_pending,
+    search_titles,
+    set_status,
+    submit_request,
+)
 from Backend.helper.metadata import (
     fetch_selected_movie_metadata,
     fetch_selected_tv_metadata,
+    gradient_cover_path,
+    resolve_cover_url,
     search_movie_candidates,
     search_tv_candidates,
 )
-from Backend.helper.passwords import hash_password
-from Backend.helper.pyro import get_readable_time
+from Backend.helper.passwords import hash_password, verify_password
+from Backend.helper.pyro import get_readable_file_size, get_readable_time
 from Backend.helper.scan_manager import dbcheck_manager, scan_manager
 from Backend.helper.settings_manager import SettingsManager
+from Backend.helper.split_files import strip_part_suffix
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import (
     StreamBot,
     client_avg_mbps,
+    client_dc_map,
     client_failures,
     multi_clients,
     work_loads,
@@ -65,6 +86,14 @@ async def get_system_stats_api():
         }
 
 
+#----- Expand stored gradient cover paths into full URLs for UI responses
+def _resolve_covers(items) -> None:
+    for item in items or []:
+        for key in ("poster", "backdrop"):
+            if item.get(key):
+                item[key] = resolve_cover_url(item[key])
+
+
 #----- Media management
 async def list_media_api(
     media_type: str = Query("movie", regex="^(movie|tv)$"),
@@ -73,25 +102,24 @@ async def list_media_api(
     search: str = Query("", max_length=100)
 ):
     try:
+        key = "movies" if media_type == "movie" else "tv_shows"
         if search:
             result = await db.search_documents(search, page, page_size)
             filtered_results = [item for item in result['results'] if item.get('media_type') == media_type]
             total_filtered = len(filtered_results)
             start_index = (page - 1) * page_size
-            end_index = start_index + page_size
-            paged_results = filtered_results[start_index:end_index]
-            
-            return {
+            resp = {
                 "total_count": total_filtered,
                 "current_page": page,
                 "total_pages": (total_filtered + page_size - 1) // page_size,
-                "movies" if media_type == "movie" else "tv_shows": paged_results
+                key: filtered_results[start_index:start_index + page_size],
             }
+        elif media_type == "movie":
+            resp = await db.sort_movies([], page, page_size)
         else:
-            if media_type == "movie":
-                return await db.sort_movies([], page, page_size)
-            else:
-                return await db.sort_tv_shows([], page, page_size)
+            resp = await db.sort_tv_shows([], page, page_size)
+        _resolve_covers(resp.get(key))
+        return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -412,7 +440,8 @@ async def get_admin_stats_api() -> dict:
 
         bot_stats.append({
             "client_index": client_index,
-            "display_name": f"Bot {client_index + 1}",
+            "display_name": "Userbot" if client_index < 0 else f"Bot {client_index + 1}",
+            "dc": client_dc_map.get(client_index),
             "current_load": load,
             "failures": failures,
             "avg_mbps": round(mbps, 2),
@@ -467,6 +496,62 @@ async def clear_stream_analytics_api() -> dict:
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+#----- Public: search titles to request (by name, IMDb id or TMDB id)
+async def request_search_api(q: str) -> dict:
+    try:
+        return {"status": "success", "data": await search_titles(q)}
+    except Exception as e:
+        LOGGER.error(f"Request search error: {e}")
+        return {"status": "error", "message": str(e), "data": []}
+
+
+#----- Public: submit a request for a title
+async def request_submit_api(payload: dict, client_ip: str) -> dict:
+    result = await submit_request(
+        media_type=payload.get("media_type"),
+        tmdb_id=payload.get("tmdb_id"),
+        imdb_id=payload.get("imdb_id"),
+        title=payload.get("title"),
+        year=payload.get("year"),
+        poster=payload.get("poster"),
+        client_ip=client_ip,
+    )
+    return {"status": "success" if result.get("ok") else "error", **result}
+
+
+#----- Public: most-requested pending titles
+async def request_popular_api() -> dict:
+    try:
+        return {"status": "success", "data": await popular_pending()}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": []}
+
+
+#----- Admin: list all content requests
+async def get_requests_api() -> dict:
+    try:
+        return {"status": "success", "data": await list_requests()}
+    except Exception as e:
+        LOGGER.error(f"Requests API error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+#----- Admin: uploaded / denied / banned / pending
+async def update_request_api(request_id: str, payload: dict) -> dict:
+    new_status = str(payload.get("status", "")).strip()
+    doc = await set_status(request_id, new_status)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Request not found or invalid status.")
+    return {"status": "success", "data": doc}
+
+
+async def delete_request_api(request_id: str) -> dict:
+    if not await delete_request(request_id):
+        raise HTTPException(status_code=404, detail="Request not found.")
+    return {"status": "success", "message": "Request deleted."}
+
 
 #----- Admin subscription management
 async def get_subscription_plans_api() -> dict:
@@ -767,6 +852,214 @@ async def apply_media_rescan_api(request: Request, tmdb_id: int, db_index: int, 
 }
 
 
+#----- Manual add: resolve a Telegram post link into a streamable file
+async def resolve_telegram_api(payload: dict) -> dict:
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+    try:
+        data = await resolve_telegram_message(
+            client,
+            url=payload.get("url"),
+            chat_id=payload.get("chat_id"),
+            msg_id=payload.get("msg_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read that message: {exc}")
+    return {"status": "success", "data": data}
+
+
+#----- Build a metadata base (title-level fields) from various sources
+def _metadata_base(source: dict, from_doc: bool = False) -> dict:
+    genres = source.get("genres")
+    if isinstance(genres, str):
+        genres = [g.strip() for g in genres.split(",") if g.strip()]
+    year = source.get("release_year") if from_doc else source.get("year")
+    rate = source.get("rating") if from_doc else source.get("rate")
+    return {
+        "tmdb_id": source.get("tmdb_id"),
+        "imdb_id": source.get("imdb_id") or None,
+        "title": (source.get("title") or "").strip(),
+        "year": int(year) if str(year or "").strip().lstrip("-").isdigit() else 0,
+        "rate": float(rate) if str(rate or "").replace(".", "", 1).isdigit() else 0,
+        "description": source.get("description") or "",
+        "poster": source.get("poster") or "",
+        "backdrop": source.get("backdrop") or "",
+        "logo": source.get("logo") or "",
+        "genres": genres or [],
+        "cast": source.get("cast") or [],
+        "runtime": str(source.get("runtime") or ""),
+        "original_language": source.get("original_language"),
+        "origin_country": source.get("origin_country") or [],
+    }
+
+
+_PLACEHOLDER_GENRES = ["Action", "Adventure", "Comedy", "Drama", "Fantasy",
+                       "Thriller", "Mystery", "Sci-Fi", "Romance", "Family"]
+_PLACEHOLDER_DESCRIPTIONS = [
+    "A gripping story full of unexpected twists and turns.",
+    "An unforgettable journey that keeps you on the edge of your seat.",
+    "A captivating tale of drama, courage and emotion.",
+    "An entertaining experience packed with memorable moments.",
+    "A thrilling adventure blending heart, action and wonder.",
+]
+
+
+#----- Fill empty optional metadata with random values and a gradient cover path
+def _fill_placeholder_metadata(meta: dict) -> None:
+    title = meta.get("title") or "Media"
+    if not meta.get("poster"):
+        meta["poster"] = gradient_cover_path(title, portrait=True)
+    if not meta.get("backdrop"):
+        meta["backdrop"] = gradient_cover_path(title)
+    if not meta.get("genres"):
+        meta["genres"] = random.sample(_PLACEHOLDER_GENRES, random.randint(1, 3))
+    if not meta.get("rate"):
+        meta["rate"] = round(random.uniform(6.0, 8.9), 1)
+    if not meta.get("description"):
+        meta["description"] = random.choice(_PLACEHOLDER_DESCRIPTIONS)
+
+
+#----- Manual add: create/append a movie, tv show, season, episode or stream by hand
+async def manual_add_media_api(payload: dict) -> dict:
+    media_type = payload.get("media_type")
+    if media_type not in ("movie", "tv"):
+        raise HTTPException(status_code=400, detail="media_type must be 'movie' or 'tv'.")
+
+    stream = payload.get("stream") or {}
+    quality = str(stream.get("quality") or "").strip()
+    if not quality:
+        raise HTTPException(status_code=400, detail="A quality label (e.g. 1080p) is required.")
+
+    #----- One source = single file, multiple sources = split file parts (in order)
+    part_sources = stream.get("parts")
+    if not isinstance(part_sources, list) or not part_sources:
+        part_sources = [{"url": stream.get("url"), "chat_id": stream.get("chat_id"), "msg_id": stream.get("msg_id")}]
+    part_sources = [p for p in part_sources if p and (p.get("url") or (p.get("chat_id") and p.get("msg_id")))]
+    if not part_sources:
+        raise HTTPException(status_code=400, detail="Provide at least one Telegram message link.")
+
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+
+    resolved_parts = []
+    for src in part_sources:
+        try:
+            resolved_parts.append(await resolve_telegram_message(
+                client, url=src.get("url"), chat_id=src.get("chat_id"), msg_id=src.get("msg_id"),
+            ))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read that message: {exc}")
+
+    primary = resolved_parts[0]
+    is_split = len(resolved_parts) > 1
+    raw_name = (stream.get("name") or primary["name"]).strip()
+    name = strip_part_suffix(raw_name) if is_split else raw_name
+
+    #----- Resolve the title-level metadata: existing doc, TMDB/IMDb pick, or manual entry
+    tmdb_id = payload.get("tmdb_id")
+    db_index = payload.get("db_index")
+    selected_id = str(payload.get("selected_id") or "").strip()
+
+    base = None
+    if tmdb_id and db_index:
+        doc = await db.get_document(media_type, int(tmdb_id), int(db_index))
+        if doc:
+            base = _metadata_base(doc, from_doc=True)
+    if base is None and selected_id:
+        selection = await (
+            fetch_selected_movie_metadata(selected_id) if media_type == "movie"
+            else fetch_selected_tv_metadata(selected_id)
+        )
+        if not selection:
+            raise HTTPException(status_code=404, detail="Could not fetch metadata for the selected title.")
+        base = _metadata_base(selection, from_doc=True)
+    if base is None:
+        base = _metadata_base(payload.get("manual_metadata") or {})
+        if not base["title"]:
+            raise HTTPException(status_code=400, detail="A title is required for manual entry.")
+        if not base["year"]:
+            base["year"] = int(primary.get("upload_year") or 0)
+
+    #----- Brand-new hand-made titles get a negative synthetic id (never collides with TMDB)
+    if not base.get("tmdb_id"):
+        base["tmdb_id"] = -(secrets.randbelow(2_000_000_000) + 1)
+    #----- A synthetic "tg" imdb id is required so Stremio can request meta/streams
+    if not base.get("imdb_id"):
+        base["imdb_id"] = f"tg{abs(int(base['tmdb_id']))}"
+    _fill_placeholder_metadata(base)
+
+    #----- Store the file thumbnail as a base-relative path so it survives base_url changes
+    thumb_url = ""
+    if primary.get("has_thumb"):
+        thumb_enc = await encode_string({"chat_id": int(primary["chat_id"]), "msg_id": int(primary["msg_id"])})
+        thumb_url = f"/thumb/{thumb_enc}"
+
+    #----- Split parts share one quality entry via a common group key
+    group_key = f"manual:{primary['chat_id']}:{quality}:{secrets.token_hex(6)}" if is_split else None
+
+    tv_extra = {}
+    if media_type == "tv":
+        try:
+            season_number = int(payload.get("season_number"))
+            episode_number = int(payload.get("episode_number"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Season and episode numbers are required for TV.")
+        tv_extra = {
+            "season_number": season_number,
+            "episode_number": episode_number,
+            "episode_title": (payload.get("episode_title") or "").strip() or f"S{season_number:02d}E{episode_number:02d}",
+            "episode_backdrop": payload.get("episode_backdrop") or thumb_url or base.get("backdrop") or "",
+            "episode_overview": payload.get("episode_overview") or "",
+            "episode_released": payload.get("episode_released") or "",
+        }
+
+    for index, part in enumerate(resolved_parts, start=1):
+        p_channel = int(part["chat_id"])
+        p_msg = int(part["msg_id"])
+        encoded = await encode_string({"chat_id": p_channel, "msg_id": p_msg})
+        metadata_info = dict(base)
+        metadata_info.update({
+            "media_type": media_type,
+            "quality": quality,
+            "encoded_string": encoded,
+            "group_key": group_key,
+            "part_number": index if is_split else None,
+            "is_anime": False,
+        })
+        metadata_info.update(tv_extra)
+        updated_id = await db.insert_media(
+            metadata_info, channel=p_channel, msg_id=p_msg,
+            size=part["size"], name=name, raw_size=int(part.get("raw_size") or 0),
+        )
+        if not updated_id:
+            raise HTTPException(status_code=500, detail="Failed to add media (validation error).")
+
+    result_tmdb_id = base["tmdb_id"]
+    location = await db.find_media_doc(media_type, result_tmdb_id)
+    result_db_index = location[1] if location else db.current_db_index
+
+    if result_tmdb_id and result_tmdb_id > 0:
+        try:
+            start_single_media_catalog_sync(db, tmdb_id=result_tmdb_id, media_type=media_type)
+        except Exception:
+            pass
+
+    message = f"Split stream added ({len(resolved_parts)} parts)." if is_split else "Stream added successfully."
+    return {
+        "status": "success",
+        "message": message,
+        "tmdb_id": result_tmdb_id,
+        "db_index": result_db_index,
+        "media_type": media_type,
+    }
+
+
 #----- Custom catalog APIs
 def _normalize_media_type(media_type: str) -> str:
     return "tv" if media_type in ["tv", "series"] else "movie"
@@ -793,13 +1086,26 @@ async def list_custom_catalogs_api(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_VISIBILITY_MODES = ("public", "tokens", "owner")
+
+
+#----- Parse a (visibility, allowed_tokens) pair from a request payload
+def _clean_visibility(payload: dict):
+    visibility = payload.get("visibility")
+    if visibility not in _VISIBILITY_MODES:
+        visibility = None
+    tokens = payload.get("allowed_tokens")
+    tokens = [str(t).strip() for t in tokens if str(t).strip()] if isinstance(tokens, list) else []
+    return visibility, tokens
+
+
 async def create_custom_catalog_api(payload: dict):
     name = (payload.get("name") or "").strip()
-    visible = bool(payload.get("visible", True))
     if not name:
         raise HTTPException(status_code=400, detail="Catalog name is required.")
 
-    catalog_id = await db.create_custom_catalog(name=name, visible=visible)
+    visibility, tokens = _clean_visibility(payload)
+    catalog_id = await db.create_custom_catalog(name=name, visibility=visibility or "public", allowed_tokens=tokens)
     if not catalog_id:
         raise HTTPException(status_code=500, detail="Failed to create catalog.")
 
@@ -809,13 +1115,47 @@ async def create_custom_catalog_api(payload: dict):
 
 async def update_custom_catalog_api(catalog_id: str, payload: dict):
     name = payload.get("name")
-    visible = payload.get("visible") if "visible" in payload else None
-    result = await db.update_custom_catalog(catalog_id, name=name, visible=visible)
+    visibility, tokens = _clean_visibility(payload)
+    exclusive = payload.get("exclusive")
+    exclusive = bool(exclusive) if exclusive is not None else None
+    searchable = bool(payload.get("searchable"))
+    result = await db.update_custom_catalog(
+        catalog_id, name=name, visibility=visibility, allowed_tokens=tokens,
+        exclusive=exclusive, searchable=searchable,
+    )
     if not result:
         catalog = await db.get_custom_catalog(catalog_id)
         if not catalog:
             raise HTTPException(status_code=404, detail="Catalog not found.")
     return {"message": "Catalog updated successfully.", "catalog": await db.get_custom_catalog(catalog_id)}
+
+
+#----- Set a title's visibility across every catalog it belongs to (used by media edit)
+async def set_media_visibility_api(payload: dict):
+    tmdb_id = payload.get("tmdb_id")
+    db_index = payload.get("db_index")
+    media_type = payload.get("media_type")
+    if not tmdb_id or not db_index or media_type not in ("movie", "tv", "series"):
+        raise HTTPException(status_code=400, detail="tmdb_id, db_index and media_type are required.")
+
+    visibility, tokens = _clean_visibility(payload)
+    if not visibility:
+        raise HTTPException(status_code=400, detail="A valid visibility is required.")
+
+    count = await db.set_media_visibility(
+        int(tmdb_id), int(db_index), _normalize_media_type(media_type), visibility, tokens
+    )
+    return {
+        "status": "success",
+        "updated_catalogs": count,
+        "message": "Visibility updated — applies to default catalogs and every catalog this title is in.",
+    }
+
+
+#----- Current effective visibility of a title (from the catalogs it belongs to)
+async def get_media_visibility_api(tmdb_id: int, db_index: int, media_type: str):
+    data = await db.get_media_visibility(int(tmdb_id), int(db_index), _normalize_media_type(media_type))
+    return {"visibility": data or {}}
 
 
 async def delete_custom_catalog_api(catalog_id: str):
@@ -835,6 +1175,7 @@ async def get_custom_catalog_items_api(
         data = await db.get_custom_catalog_items(catalog_id, media_type, page, page_size)
         if not data.get("catalog"):
             raise HTTPException(status_code=404, detail="Catalog not found.")
+        _resolve_covers(data.get("items"))
         return data
     except HTTPException:
         raise
@@ -878,8 +1219,19 @@ async def add_custom_catalog_item_api(catalog_id: str, payload: dict):
         raise HTTPException(status_code=404, detail="Catalog not found.")
 
     added = await db.add_item_to_custom_catalog(catalog_id, int(tmdb_id), int(db_index), media_type)
+    visibility_synced = None
+    if added:
+        #----- Adding to a hidden/restricted catalog adopts that visibility onto the title
+        cat_vis = catalog.get("visibility")
+        if cat_vis in ("owner", "tokens"):
+            await db.set_media_visibility(
+                int(tmdb_id), int(db_index), media_type, cat_vis, catalog.get("allowed_tokens") or []
+            )
+            visibility_synced = cat_vis
+        if catalog.get("exclusive"):
+            await db.mark_item_exclusive(catalog_id, int(tmdb_id), int(db_index), media_type, catalog.get("searchable", False))
     message = "Added to catalog." if added else "Already exists in this catalog."
-    return {"message": message, "added": added}
+    return {"message": message, "added": added, "visibility_synced": visibility_synced}
 
 
 async def remove_custom_catalog_item_api(
@@ -897,12 +1249,14 @@ async def remove_custom_catalog_item_api(
     )
     if not removed:
         return {"message": "Item was not in this catalog.", "removed": False}
+    if catalog.get("exclusive"):
+        await db.clear_item_exclusive(int(tmdb_id), int(db_index), _normalize_media_type(media_type))
     return {"message": "Removed from catalog.", "removed": True}
 
 
-async def auto_sync_custom_catalogs_api(full_rebuild: bool = False):
+async def auto_sync_custom_catalogs_api(force_refresh: bool = False):
     try:
-        result = await start_auto_catalog_sync_background(db, force=True, full_rebuild=full_rebuild)
+        result = await start_auto_catalog_sync_background(db, force=True, force_refresh=force_refresh)
         return {"message": result.get("message", "Auto sync started."), "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -968,12 +1322,12 @@ async def update_settings_api(payload: dict) -> dict:
         del payload["session_secret"]
 
     #----- Type coercion and validation
-    bool_keys = {"replace_mode", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both"}
+    bool_keys = {"replace_mode", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both", "announce_new_content"}
     for key in bool_keys:
         if key in payload:
             payload[key] = bool(payload[key])
 
-    list_str_keys = {"auth_channels", "multi_tokens", "extra_databases", "global_search_channels", "anime_channels"}
+    list_str_keys = {"auth_channels", "multi_tokens", "extra_databases", "global_search_channels", "anime_channels", "manual_channels"}
     for key in list_str_keys:
         if key in payload:
             if not isinstance(payload[key], list):
@@ -1031,10 +1385,25 @@ async def update_settings_api(payload: dict) -> dict:
             cleaned.append(channel)
         payload["anime_channels"] = cleaned
 
+    if "manual_channels" in payload:
+        cleaned = []
+        for channel in payload["manual_channels"]:
+            channel = str(channel).strip()
+            if not channel:
+                continue
+            try:
+                int(channel.replace("-100", ""))
+            except ValueError:
+                raise HTTPException(status_code=400,
+                    detail=f"Invalid manual channel id: {channel}"
+                    )
+            cleaned.append(channel)
+        payload["manual_channels"] = cleaned
+
     #----- Strip whitespace from string fields
     for key in ("tmdb_api", "base_url", "upstream_repo", "upstream_branch",
                 "admin_username", "admin_password", "session_secret", "http_proxy_url",
-                "payment_instructions", "payment_qr_url"):
+                "payment_instructions", "payment_qr_url", "announcement_channel"):
         if key in payload and isinstance(payload[key], str):
             payload[key] = payload[key].strip()
 
@@ -1149,3 +1518,149 @@ async def purge_dead_links_api(payload: dict | None = None) -> dict:
         result = await dbcheck_manager.purge()
 
     return {"status": "success" if result.get("ok") else "error", **result}
+
+
+
+#----- ── System & Maintenance (web replacements for /stats, /log, /restart) ──
+
+LOG_FILE = "log.txt"
+
+
+#----- Aggregate content + system metrics across all storage DBs (was /stats)
+async def get_db_stats_api() -> dict:
+    try:
+        total_movies = total_tv = total_episodes = total_streams = total_db_size = 0
+
+        for i in range(1, db.current_db_index + 1):
+            storage = db.dbs.get(f"storage_{i}")
+            if storage is None:
+                continue
+
+            total_movies += await storage["movie"].count_documents({})
+            async for movie in storage["movie"].find({}, {"telegram": 1}):
+                total_streams += len(movie.get("telegram", []))
+
+            total_tv += await storage["tv"].count_documents({})
+            async for show in storage["tv"].find({}, {"seasons": 1}):
+                for season in show.get("seasons", []):
+                    for episode in season.get("episodes", []):
+                        total_episodes += 1
+                        total_streams += len(episode.get("telegram", []))
+
+            try:
+                total_db_size += (await storage.command("dbStats")).get("dataSize", 0)
+            except Exception:
+                pass
+
+        return {
+            "status": "success",
+            "data": {
+                "version": __version__,
+                "movies": total_movies,
+                "tv_shows": total_tv,
+                "episodes": total_episodes,
+                "streams": total_streams,
+                "uptime": get_readable_time(int(time() - StartTime)),
+                "db_size": get_readable_file_size(total_db_size),
+                "storage_dbs": db.current_db_index,
+                "auth_channels": len(SettingsManager.current().auth_channels),
+            },
+        }
+    except Exception as e:
+        LOGGER.error(f"[Stats] Error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+#----- First-run setup checklist: what's configured vs still missing
+async def setup_status_api() -> dict:
+    s = SettingsManager.current()
+    checks = [
+        {"key": "tmdb", "label": "TMDB API key", "done": bool(s.tmdb_api),
+         "hint": "Powers automatic poster & metadata matching."},
+        {"key": "channels", "label": "AUTH channel added", "done": len(s.auth_channels) > 0,
+         "hint": "The channel(s) the bot indexes and streams from."},
+        {"key": "base_url", "label": "Base URL set", "done": bool(s.base_url),
+         "hint": "Stremio uses this public address to reach your streams."},
+        {"key": "password", "label": "Admin password changed", "done": not verify_password("admin", s.admin_password),
+         "hint": "Change the default admin / admin login for security."},
+    ]
+    done = sum(1 for c in checks if c["done"])
+    return {"status": "success", "data": {
+        "checks": checks, "done": done, "total": len(checks), "complete": done == len(checks),
+    }}
+
+
+#----- Config backup export (settings minus secrets + catalogs, plans, tokens)
+async def export_config_api() -> dict:
+    return await export_config()
+
+
+#----- Config backup restore
+async def import_config_api(payload: dict) -> dict:
+    try:
+        result = await import_config(payload)
+        return {"status": "success", "result": result, "message": "Backup restored successfully."}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        LOGGER.error(f"Config import error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+#----- Lightweight liveness probe; start_time changes on every boot (restart detection)
+async def health_api() -> dict:
+    return {"status": "ok", "start_time": StartTime, "version": __version__}
+
+
+#----- Full diagnostics report (DBs, bot clients, TMDB, base URL)
+async def health_report_api(force: bool = False) -> dict:
+    try:
+        return {"status": "success", "data": await run_health_checks(force=force)}
+    except Exception as e:
+        LOGGER.error(f"Health report error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+#----- Tail of the log file for the web viewer (was /log)
+async def get_logs_api(lines: int = 300) -> dict:
+    path = os.path.abspath(LOG_FILE)
+    if not os.path.exists(path):
+        return {"status": "error", "message": "Log file not found.", "log": ""}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-max(1, min(lines, 2000)):]
+        return {"status": "success", "log": "".join(tail)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "log": ""}
+
+
+#----- Download the raw log file (was /log document)
+async def download_logs_api():
+    path = os.path.abspath(LOG_FILE)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Log file not found.")
+    return FileResponse(path, filename="log.txt", media_type="text/plain")
+
+
+#----- Run the updater then re-exec the app; runs after the HTTP response is flushed
+async def _perform_restart(delay: float = 1.0) -> None:
+    await asyncio.sleep(delay)
+    try:
+        LOGGER.info("Web-triggered restart: running updater...")
+        proc = await asyncio.create_subprocess_exec("uv", "run", "update.py")
+        await proc.wait()
+    except Exception as e:
+        LOGGER.error(f"Restart updater failed: {e}")
+
+    uv_path = shutil.which("uv")
+    if not uv_path:
+        LOGGER.error("Restart aborted: uv not found in PATH.")
+        return
+    LOGGER.info("Web-triggered restart: re-executing app...")
+    os.execl(uv_path, uv_path, "run", "-m", "Backend")
+
+
+#----- Trigger a restart from the web (was /restart)
+async def restart_app_api() -> dict:
+    asyncio.create_task(_perform_restart())
+    return {"status": "success", "message": "Restart initiated — the server will be back shortly."}
